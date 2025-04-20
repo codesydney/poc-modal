@@ -1,21 +1,31 @@
 import modal
-import pdfplumber  # Better PDF extraction
+import pdfplumber
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import io
 import re
 from typing import List, Dict
+import lancedb
+import pyarrow as pa
+import os
+import shutil
 
-# Define image with improved dependencies
-image = modal.Image.debian_slim().pip_install(
-    "numpy==1.26.4",
-    "pdfplumber",  # Replaced pypdf
-    "sentence-transformers",
-    "huggingface_hub[hf_xet]",  # For better model downloads
-    "langchain"  # Keeping for advanced splitting if needed
+image = (
+    modal.Image.debian_slim()
+    .apt_install("git")  # Needed for LanceDB's internal operations
+    .pip_install(
+        "numpy==1.26.4",
+        "pdfplumber",
+        "sentence-transformers",
+        "lancedb>=0.5.0",
+        "pyarrow>=12.0.0",
+        "pandas",
+        "huggingface_hub[hf_transfer]",
+        "huggingface_hub[hf_xet]"
+    )
 )
 
-app = modal.App("rag-pdf-processor", image=image)
+app = modal.App("rag-pdf-processor-lancedb", image=image)
 vol = modal.Volume.from_name("pdf-storage", create_if_missing=True)
 
 # Better embedding model
@@ -29,12 +39,10 @@ def clean_text(text: str) -> str:
 
 def split_text(text: str) -> List[str]:
     """Improved text splitting with paragraph awareness"""
-    # First split by paragraphs
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     
     chunks = []
     for para in paragraphs:
-        # If paragraph is too long, split further
         if len(para) > 500:
             words = para.split()
             for i in range(0, len(words), 300):
@@ -43,13 +51,36 @@ def split_text(text: str) -> List[str]:
             chunks.append(para)
     return chunks
 
-@app.function(
-    volumes={"/data": vol},
-    timeout=600,
-    image=image
-)
+def create_lancedb_table(chunks: List[str], embeddings: np.ndarray) -> str:
+    """Create table from PDF chunks and embeddings"""
+    # Process in temporary directory first
+    tmp_db_path = "/tmp/lancedb"
+    db = lancedb.connect(tmp_db_path)
+    
+    data = pa.Table.from_arrays(
+        [
+            pa.array([str(i) for i in range(len(chunks))]),
+            pa.array(chunks),
+            pa.array(embeddings.tolist()),
+        ],
+        names=["id", "text", "vector"]
+    )
+    
+    # Create in temporary location
+    db.create_table("pdf_chunks", data=data, mode="overwrite")
+    
+    # Now persist to volume
+    vol_db_path = "/data/lancedb"
+    if os.path.exists(tmp_db_path):
+        if os.path.exists(vol_db_path):
+            shutil.rmtree(vol_db_path)
+        shutil.copytree(tmp_db_path, vol_db_path)
+    
+    return f"Table created and persisted to {vol_db_path}"
+
+@app.function(volumes={"/data": vol}, timeout=600)
 def process_pdf(pdf_bytes: bytes) -> Dict:
-    """Enhanced PDF processing with better text extraction"""
+    """Process PDF and store embeddings in LanceDB"""
     text = ""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -58,44 +89,57 @@ def process_pdf(pdf_bytes: bytes) -> Dict:
                 text += clean_text(page_text) + "\n\n"
     
     chunks = split_text(text)
-    
-    # Generate embeddings with better model
     embeddings = embedding_model.encode(chunks)
+   
+    # Store in LanceDB
+    create_lancedb_table(chunks, embeddings)
     
-    # Store with metadata
-    with open("/data/chunks.txt", "w") as f:
-        f.write("\n".join(chunks))
-    np.save("/data/embeddings.npy", embeddings)
+    # Explicitly commit volume changes
+    vol.commit()
+
+    # Directly use '/data' for the volume
+    db = lancedb.connect("/data/lancedb")  # Access volume via /data path
+    print("Tables after creation:", db.table_names())  # Should show ["pdf_chunks"]
     
     return {"status": "success", "num_chunks": len(chunks)}
 
-@app.function(
-    volumes={"/data": vol},
-    image=image
-)
-def query(question: str) -> Dict:
-    """Enhanced query with context awareness"""
+@app.function(volumes={"/data": vol})
+def query(question: str) -> dict:
+    vol.reload()  # Ensure we have latest volume contents
+    
     try:
-        embeddings = np.load("/data/embeddings.npy")
-        with open("/data/chunks.txt", "r") as f:
-            chunks = f.read().split("\n")
-        
-        question_embed = embedding_model.encode(question)
-        scores = np.dot(embeddings, question_embed)
-        
-        # Get top 3 answers for better context
-        top_indices = np.argsort(scores)[-3:][::-1]
-        
-        return {
-            "answers": [chunks[i] for i in top_indices],
-            "scores": [float(scores[i]) for i in top_indices],
-            "best_answer": chunks[top_indices[0]],
-            "confidence": float(scores[top_indices[0]])
-        }
-    except FileNotFoundError:
-        return {"error": "No processed PDF found. Process a PDF first."}
+        db = lancedb.connect("/data/lancedb")
+        table_names = db.table_names()
+        print("Available tables:", table_names)
 
-# CLI entrypoints
+        if not table_names or "pdf_chunks" not in table_names:
+            return {"error": "No tables found. Please process a PDF first."}
+
+        # Verify table exists and is accessible
+        try:
+            table = db.open_table("pdf_chunks")
+            # Test read
+            test_read = table.to_arrow().to_pandas()
+            if len(test_read) == 0:
+                return {"error": "Table exists but is empty"}
+        except Exception as e:
+            return {"error": f"Table access failed: {str(e)}"}
+
+        # Proceed with query
+        question_embed = embedding_model.encode(question).tolist()
+        results = table.search(question_embed).limit(3).to_pandas()
+
+        return {
+            "answers": results["text"].tolist(),
+            "scores": results["_distance"].tolist(),
+            "best_answer": results["text"].iloc[0],
+            "confidence": float(1 - results["_distance"].iloc[0])
+        }
+
+    except Exception as e:
+        return {"error": f"Query failed: {str(e)}"}
+
+# CLI entrypoints (unchanged)
 @app.local_entrypoint()
 def upload(file_path: str):
     """Process a local PDF file"""
@@ -105,24 +149,17 @@ def upload(file_path: str):
     print(f"Processed {file_path}: {result}")
 
 @app.local_entrypoint()
-def ask(question: str):
-    """Enhanced query interface"""
+def ask(question: str, top_k: int = 3):
+    """Query the processed PDF"""
     result = query.remote(question)
     if "error" in result:
         print("Error:", result["error"])
     else:
         print("\nBest Answer:")
         print(result["best_answer"])
-        print(f"\nConfidence: {result['confidence']:.2f}")
+        print(f"\nConfidence: {1 - result['scores'][0]:.2f}")
         
         print("\nAdditional Context:")
         for i, (answer, score) in enumerate(zip(result["answers"], result["scores"])):
-            print(f"\n[{i+1}] (Score: {score:.2f}):")
+            print(f"\n[{i+1}] (Score: {1 - score:.2f}):")
             print(answer)
-
-
-# Add this to your existing Modal app
-@app.function()
-def get_query():
-    # This returns the query function itself
-    return query
