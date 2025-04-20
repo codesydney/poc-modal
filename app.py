@@ -119,3 +119,10 @@ def ask(question: str):
         for i, (answer, score) in enumerate(zip(result["answers"], result["scores"])):
             print(f"\n[{i+1}] (Score: {score:.2f}):")
             print(answer)
+
+
+# Add this to your existing Modal app
+@app.function()
+def get_query():
+    # This returns the query function itself
+    return query
